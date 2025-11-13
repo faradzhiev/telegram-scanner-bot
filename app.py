@@ -3,10 +3,11 @@ import logging
 import requests
 import time
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from threading import Thread
 import sqlite3
 from flask import Flask, request
+import hashlib
 
 app = Flask(__name__)
 
@@ -19,10 +20,17 @@ BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 class TelegramScannerBot:
     def __init__(self):
         self.active_chats = set()
+        self.sent_signals = {}  # Для защиты от дублирования
+        self.settings = {
+            'oi_min_change': 5.0,      # Минимальное изменение OI %
+            'oi_min_volume': 0.5,      # Минимальный объем в млн $
+            'pump_min_change': 1.5,    # Минимальное изменение пампов %
+            'cooldown_minutes': 10,    # Кду между одинаковыми сигналами
+        }
         self.init_database()
         self.load_active_chats()
         self.start_monitoring()
-        logging.info("✅ Бот запущен на Render!")
+        logging.info("✅ Бот запущен с улучшениями!")
 
     def init_database(self):
         conn = sqlite3.connect('/tmp/signals.db')
@@ -33,6 +41,15 @@ class TelegramScannerBot:
                 username TEXT,
                 first_name TEXT,
                 registered_at DATETIME
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_settings (
+                chat_id TEXT PRIMARY KEY,
+                oi_min_change REAL DEFAULT 5.0,
+                oi_min_volume REAL DEFAULT 0.5,
+                pump_min_change REAL DEFAULT 1.5,
+                cooldown_minutes INTEGER DEFAULT 10
             )
         ''')
         conn.commit()
@@ -49,6 +66,40 @@ class TelegramScannerBot:
         except:
             pass
 
+    def get_user_settings(self, chat_id):
+        try:
+            conn = sqlite3.connect('/tmp/signals.db')
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM user_settings WHERE chat_id = ?', (chat_id,))
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result:
+                return {
+                    'oi_min_change': result[1],
+                    'oi_min_volume': result[2],
+                    'pump_min_change': result[3],
+                    'cooldown_minutes': result[4]
+                }
+        except:
+            pass
+        return self.settings.copy()
+
+    def save_user_settings(self, chat_id, settings):
+        try:
+            conn = sqlite3.connect('/tmp/signals.db')
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO user_settings 
+                (chat_id, oi_min_change, oi_min_volume, pump_min_change, cooldown_minutes)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (chat_id, settings['oi_min_change'], settings['oi_min_volume'], 
+                  settings['pump_min_change'], settings['cooldown_minutes']))
+            conn.commit()
+            conn.close()
+        except:
+            pass
+
     def save_user_chat(self, chat_id, username, first_name):
         conn = sqlite3.connect('/tmp/signals.db')
         cursor = conn.cursor()
@@ -57,6 +108,14 @@ class TelegramScannerBot:
             (chat_id, username, first_name, registered_at)
             VALUES (?, ?, ?, datetime('now'))
         ''', (chat_id, username, first_name))
+        
+        # Создаем настройки по умолчанию для нового пользователя
+        cursor.execute('''
+            INSERT OR IGNORE INTO user_settings 
+            (chat_id, oi_min_change, oi_min_volume, pump_min_change, cooldown_minutes)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (chat_id, 5.0, 0.5, 1.5, 10))
+        
         conn.commit()
         conn.close()
         self.active_chats.add(chat_id)
@@ -66,70 +125,117 @@ class TelegramScannerBot:
         data = {
             'chat_id': chat_id,
             'text': text,
-            'parse_mode': 'HTML'
+            'parse_mode': 'HTML',
+            'disable_web_page_preview': False
         }
         try:
             requests.post(url, data=data, timeout=10)
         except:
             pass
 
-    def broadcast_signal(self, message):
+    def broadcast_signal(self, message, signal_hash):
+        """Рассылка сигнала с проверкой дублирования"""
+        if self.is_duplicate_signal(signal_hash):
+            logging.info(f"⏭️ Пропущен дубликат сигнала: {signal_hash}")
+            return False
+            
         for chat_id in self.active_chats:
+            user_settings = self.get_user_settings(chat_id)
             self.send_message(chat_id, message)
             time.sleep(0.1)
+        
+        self.record_signal(signal_hash)
+        return True
+
+    def is_duplicate_signal(self, signal_hash):
+        """Проверка на дублирование сигнала"""
+        now = datetime.now()
+        if signal_hash in self.sent_signals:
+            last_sent = self.sent_signals[signal_hash]
+            cooldown = timedelta(minutes=self.settings['cooldown_minutes'])
+            if now - last_sent < cooldown:
+                return True
+        return False
+
+    def record_signal(self, signal_hash):
+        """Запись отправленного сигнала"""
+        self.sent_signals[signal_hash] = datetime.now()
+        
+        # Очистка старых записей (старше 24 часов)
+        cutoff_time = datetime.now() - timedelta(hours=24)
+        self.sent_signals = {k: v for k, v in self.sent_signals.items() if v > cutoff_time}
+
+    def create_signal_hash(self, signal):
+        """Создание хеша для идентификации сигнала"""
+        signal_str = f"{signal['type']}_{signal['symbol']}_{signal['exchange']}_{signal.get('change', 0)}_{signal.get('amount', 0)}"
+        return hashlib.md5(signal_str.encode()).hexdigest()
 
     def scan_demo_signals(self):
-        """Демо-сигналы для теста"""
+        """Демо-сигналы только OI и Pump"""
         signals = []
         
-        # OI сигнал
+        # OI сигналы
         signals.append({
             'type': 'oi',
-            'symbol': 'BTCUSDT',
+            'symbol': 'BTC',
             'exchange': 'ByBit',
             'change': 7.24,
             'amount': 0.81
         })
         
-        # Pump long сигнал
+        signals.append({
+            'type': 'oi',
+            'symbol': 'ETH',
+            'exchange': 'Binance', 
+            'change': 4.32,
+            'amount': 0.56
+        })
+        
+        # Pump сигналы
         signals.append({
             'type': 'pump',
-            'symbol': 'ETHUSDT', 
-            'exchange': 'Binance',
+            'symbol': 'SOL',
+            'exchange': 'ByBit',
             'change': 2.1,
             'signal_type': 'long'
         })
         
-        # Liquidation сигнал
         signals.append({
-            'type': 'liquidation',
-            'symbol': 'SOL',
-            'exchange': 'ByBit', 
-            'amount': 34140
+            'type': 'pump', 
+            'symbol': 'ADA',
+            'exchange': 'Binance',
+            'change': -1.8,
+            'signal_type': 'short'
         })
         
         return signals
 
     def format_signal(self, signal):
+        """Форматирование сигнала с ссылками"""
+        timestamp = datetime.now().strftime('%H:%M')
+        symbol = signal['symbol']
+        
+        # Ссылки на CoinGlass
+        coinglass_url = f"https://coinglass.com/top-long-short?symbol={symbol}"
+        
         if signal['type'] == 'oi':
             return (
-                f"<b>📊 ОТКРЫТЫЙ ИНТЕРЕС – 15м – {signal['symbol']} {signal['exchange']}</b>\n"
-                f"📈 <b>ОИ вырос на {signal['change']}%</b>\n"
-                f"Объем: {signal['amount']} млн. $\n"
-                f"<i>{datetime.now().strftime('%H:%M')}</i>"
+                f"<b>📊 ОТКРЫТЫЙ ИНТЕРЕС – 15м</b>\n"
+                f"▪️ Монета: <a href='{coinglass_url}'>{symbol}</a>\n"
+                f"▪️ Биржа: {signal['exchange']}\n"
+                f"▪️ <b>ОИ вырос на {signal['change']}%</b>\n"
+                f"▪️ Объем: {signal['amount']} млн. $\n"
+                f"<i>🕒 {timestamp}</i>"
             )
         elif signal['type'] == 'pump':
-            signal_type = "ЛОНГ" if signal['signal_type'] == 'long' else "ШОРТ"
+            signal_type = "🟢 ЛОНГ" if signal['signal_type'] == 'long' else "🔴 ШОРТ"
+            change_icon = "📈" if signal['signal_type'] == 'long' else "📉"
             return (
-                f"<b>🚀 ПАМП СКРИНЕР – 1м – {signal['symbol']} {signal['exchange']}</b>\n"
-                f"<b>{signal_type}:</b> {signal['change']}%\n"
-                f"<i>{datetime.now().strftime('%H:%M')}</i>"
-            )
-        elif signal['type'] == 'liquidation':
-            return (
-                f"<b>💥 ЛИКВИДАЦИЯ – 5м – {signal['symbol']} {signal['exchange']}</b>\n"
-                f"${signal['amount']:,}\n"
-                f"<i>{datetime.now().strftime('%H:%M')}</i>"
+                f"<b>🚀 ПАМП СКРИНЕР – 1м</b>\n"
+                f"▪️ Монета: <a href='{coinglass_url}'>{symbol}</a>\n" 
+                f"▪️ Биржа: {signal['exchange']}\n"
+                f"▪️ {signal_type}: {change_icon} {abs(signal['change'])}%\n"
+                f"<i>🕒 {timestamp}</i>"
             )
 
     def start_monitoring(self):
@@ -139,11 +245,16 @@ class TelegramScannerBot:
                     signals = self.scan_demo_signals()
                     for signal in signals:
                         message = self.format_signal(signal)
-                        self.broadcast_signal(message)
-                        time.sleep(1)
+                        signal_hash = self.create_signal_hash(signal)
+                        
+                        if self.broadcast_signal(message, signal_hash):
+                            logging.info(f"📢 Отправлен сигнал: {signal['type']} {signal['symbol']}")
+                            time.sleep(2)
+                    
                     time.sleep(60)  # Проверка каждую минуту
+                    
                 except Exception as e:
-                    logging.error(f"Ошибка: {e}")
+                    logging.error(f"Ошибка мониторинга: {e}")
                     time.sleep(30)
         
         Thread(target=monitor, daemon=True).start()
@@ -158,16 +269,60 @@ class TelegramScannerBot:
             self.save_user_chat(chat_id, username, first_name)
             welcome = (
                 "🚀 <b>UNIFIED SCANNER</b>\n\n"
-                "✅ Запущено на Render\n"
-                "✅ Автоматический мониторинг\n"
-                "✅ OI + Pump + Liquidation\n\n"
+                "📊 <b>Доступные скринеры:</b>\n"
+                "• Открытый интерес (OI Scanner)\n" 
+                "• Пампы (Pump Scanner)\n\n"
+                "⚙️ <b>Команды:</b>\n"
+                "/settings - Настройки параметров\n"
+                "/status - Статус бота\n\n"
                 "<i>Сигналы приходят автоматически!</i>"
             )
             self.send_message(chat_id, welcome)
             
         elif text == '/status':
-            status = f"<b>Статус:</b> 🟢 Работает\n<b>Пользователей:</b> {len(self.active_chats)}"
+            status = (
+                f"<b>📊 Статус системы</b>\n"
+                f"• Пользователей: {len(self.active_chats)}\n"
+                f"• Активные скринеры: 2\n"
+                f"• Время: {datetime.now().strftime('%H:%M:%S')}\n"
+                f"• Режим: Демонстрационный"
+            )
             self.send_message(chat_id, status)
+            
+        elif text == '/settings':
+            user_settings = self.get_user_settings(chat_id)
+            settings_msg = (
+                f"<b>⚙️ Настройки параметров</b>\n\n"
+                f"📊 <b>OI Scanner:</b>\n"
+                f"• Мин. изменение: {user_settings['oi_min_change']}%\n"
+                f"• Мин. объем: {user_settings['oi_min_volume']}M $\n\n"
+                f"🚀 <b>Pump Scanner:</b>\n" 
+                f"• Мин. изменение: {user_settings['pump_min_change']}%\n\n"
+                f"⏰ <b>Общие:</b>\n"
+                f"• Кду дубликатов: {user_settings['cooldown_minutes']} мин\n\n"
+                f"<i>Для изменения настроек используйте цифровые команды</i>"
+            )
+            
+            # Клавиатура для быстрых настроек
+            keyboard = {
+                'inline_keyboard': [
+                    [{'text': '📊 OI мин. %', 'callback_data': 'set_oi_change'}],
+                    [{'text': '🚀 Pump мин. %', 'callback_data': 'set_pump_change'}],
+                    [{'text': '⏰ Время кду', 'callback_data': 'set_cooldown'}]
+                ]
+            }
+            
+            url = f"{BASE_URL}/sendMessage"
+            data = {
+                'chat_id': chat_id,
+                'text': settings_msg,
+                'parse_mode': 'HTML',
+                'reply_markup': json.dumps(keyboard)
+            }
+            try:
+                requests.post(url, data=data, timeout=10)
+            except:
+                pass
 
 # Создаем бота
 bot = TelegramScannerBot()
@@ -182,9 +337,11 @@ def webhook():
 @app.route('/')
 def home():
     return f'''
-    <h1>🤖 Scanner Bot</h1>
-    <p>Работает на Render!</p>
-    <p>Пользователей: {len(bot.active_chats)}</p>
+    <h1>🤖 Unified Scanner Bot</h1>
+    <p>✅ Работает на Render</p>
+    <p>📊 Активных пользователей: {len(bot.active_chats)}</p>
+    <p>🚀 Скринеры: OI + Pump</p>
+    <p>⚙️ Версия: 2.0 с улучшениями</p>
     '''
 
 if __name__ == '__main__':
